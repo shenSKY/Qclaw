@@ -1,0 +1,377 @@
+/**
+ * Translation service using MyMemory API
+ * MyMemory is free, requires no API key, works reliably in China, and provides complete translations
+ * https://mymemory.translated.net/doc/spec.php
+ */
+
+import { app } from 'electron'
+import * as fs from 'fs'
+import * as path from 'path'
+
+interface TranslationResult {
+  ok: boolean
+  translatedText: string
+  error?: string
+}
+
+interface TranslateRequest {
+  text: string
+  source?: string
+  target?: string
+}
+
+interface TranslationCacheData {
+  version: number
+  translations: Record<string, string>
+}
+
+// In-memory cache for translations
+const translationCache = new Map<string, string>()
+
+// Persistent cache file path
+let cacheFilePath: string | null = null
+let saveTimeout: NodeJS.Timeout | null = null
+let isCacheLoaded = false
+
+const CACHE_VERSION = 1
+const SAVE_DELAY_MS = 2000 // Save after 2 seconds of inactivity
+
+// Request queue with rate limiting
+interface QueuedRequest {
+  text: string
+  source: string
+  target: string
+  resolve: (result: TranslationResult) => void
+  reject: (error: Error) => void
+}
+
+const requestQueue: QueuedRequest[] = []
+let isProcessingQueue = false
+let lastRequestTime = 0
+const REQUEST_INTERVAL_MS = 500 // Wait 500ms between requests (2 requests/second)
+const CONCURRENT_LIMIT = 3 // Max 3 concurrent requests
+
+/**
+ * Detect if text contains Chinese characters
+ */
+export function containsChinese(text: string): boolean {
+  return /[\u4e00-\u9fa5]/.test(text)
+}
+
+/**
+ * Check if text needs translation (is English and not too short)
+ */
+export function needsTranslation(text: string): boolean {
+  if (!text || text.length < 2) return false
+  if (containsChinese(text)) return false
+  // Check if text is primarily English (letters, numbers, common punctuation)
+  const englishPattern = /^[A-Za-z0-9\s.,!?;:'"()\[\]{}@#$%^&*\-_+=<>\/\\|`~]+$/
+  return englishPattern.test(text)
+}
+
+/**
+ * Safe console.log that catches EPIPE errors
+ */
+function safeLog(message: string, ...args: any[]): void {
+  try {
+    console.log(message, ...args)
+  } catch {
+    // Ignore EPIPE errors when process is shutting down
+  }
+}
+
+function safeError(message: string, ...args: any[]): void {
+  try {
+    console.error(message, ...args)
+  } catch {
+    // Ignore EPIPE errors when process is shutting down
+  }
+}
+
+/**
+ * Get the cache file path
+ */
+function getCacheFilePath(): string {
+  if (!cacheFilePath) {
+    const userDataPath = app.getPath('userData')
+    cacheFilePath = path.join(userDataPath, 'translation-cache.json')
+  }
+  return cacheFilePath
+}
+
+/**
+ * Load translation cache from disk
+ */
+export function loadTranslationCache(): void {
+  if (isCacheLoaded) return
+
+  try {
+    const filePath = getCacheFilePath()
+    if (fs.existsSync(filePath)) {
+      const data = fs.readFileSync(filePath, 'utf-8')
+      const cacheData = JSON.parse(data) as TranslationCacheData
+
+      if (cacheData.version === CACHE_VERSION && cacheData.translations) {
+        Object.entries(cacheData.translations).forEach(([key, value]) => {
+          translationCache.set(key, value)
+        })
+        safeLog(`[Translation] Loaded ${translationCache.size} cached translations from disk`)
+      }
+    }
+  } catch (error) {
+    safeError('[Translation] Failed to load cache:', error)
+  } finally {
+    isCacheLoaded = true
+  }
+}
+
+/**
+ * Clear translation cache (both memory and disk)
+ */
+export function clearTranslationCache(): void {
+  try {
+    // Clear in-memory cache
+    const size = translationCache.size
+    translationCache.clear()
+    
+    // Delete cache file
+    const filePath = getCacheFilePath()
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath)
+    }
+    
+    safeLog(`[Translation] Cleared ${size} cached translations`)
+  } catch (error) {
+    safeError('[Translation] Failed to clear cache:', error)
+  }
+}
+
+/**
+ * Save translation cache to disk (debounced)
+ */
+function saveCacheToDisk(): void {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout)
+  }
+
+  saveTimeout = setTimeout(() => {
+    try {
+      const filePath = getCacheFilePath()
+      const cacheData: TranslationCacheData = {
+        version: CACHE_VERSION,
+        translations: Object.fromEntries(translationCache),
+      }
+      fs.writeFileSync(filePath, JSON.stringify(cacheData, null, 2), 'utf-8')
+      safeLog(`[Translation] Saved ${translationCache.size} translations to disk`)
+    } catch (error) {
+      safeError('[Translation] Failed to save cache:', error)
+    }
+  }, SAVE_DELAY_MS)
+}
+
+/**
+ * Initialize translation service - call on app ready
+ */
+export function initTranslationService(): void {
+  loadTranslationCache()
+
+  // Save cache on app quit
+  app.on('will-quit', () => {
+    if (saveTimeout) {
+      clearTimeout(saveTimeout)
+    }
+    // Synchronous save on quit
+    try {
+      const filePath = getCacheFilePath()
+      const cacheData: TranslationCacheData = {
+        version: CACHE_VERSION,
+        translations: Object.fromEntries(translationCache),
+      }
+      fs.writeFileSync(filePath, JSON.stringify(cacheData), 'utf-8')
+    } catch {
+      // Ignore errors during quit
+    }
+  })
+}
+
+/**
+ * Translate using MyMemory API (free, no API key required)
+ * https://mymemory.translated.net/doc/spec.php
+ * This is the only translation service used as it works reliably in China
+ */
+async function translateWithMyMemory(
+  text: string,
+  source: string,
+  target: string
+): Promise<TranslationResult> {
+  try {
+    const langPair = `${source}|${target}`
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`
+
+    // Create abort controller for timeout
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 15000) // 15 second timeout (increased for slow networks)
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      signal: controller.signal,
+    })
+
+    clearTimeout(timeoutId)
+
+    if (!response.ok) {
+      return { ok: false, translatedText: text, error: `HTTP ${response.status}` }
+    }
+
+    const data = (await response.json()) as {
+      responseStatus?: number
+      responseData?: { translatedText?: string }
+      matches?: Array<{ translation?: string; quality?: number }>
+      quotaFinished?: boolean
+    }
+
+    // Check if quota is finished
+    if (data.quotaFinished) {
+      return { ok: false, translatedText: text, error: 'API quota exceeded' }
+    }
+
+    // Check response status
+    if (data.responseStatus !== 200) {
+      return { ok: false, translatedText: text, error: 'Translation failed' }
+    }
+
+    // Get the best translation
+    let translatedText = data.responseData?.translatedText
+
+    // If we have matches, use the highest quality one
+    if (data.matches && data.matches.length > 0) {
+      const bestMatch = data.matches.reduce((best, current) => {
+        return (current.quality || 0) > (best.quality || 0) ? current : best
+      })
+      if (bestMatch.translation) {
+        translatedText = bestMatch.translation
+      }
+    }
+
+    if (translatedText) {
+      return { ok: true, translatedText }
+    }
+
+    return { ok: false, translatedText: text, error: 'No translation returned' }
+  } catch (error) {
+    // Don't log errors during process shutdown to avoid EPIPE
+    const errorMessage = error instanceof Error ? error.message : 'Network error'
+
+    // Ignore abort errors and return original text
+    if (errorMessage.includes('abort') || errorMessage.includes('EPIPE')) {
+      return { ok: false, translatedText: text, error: 'Request cancelled' }
+    }
+
+    return {
+      ok: false,
+      translatedText: text,
+      error: errorMessage,
+    }
+  }
+}
+
+/**
+ * Internal translation function without queue (used by queue processor)
+ * Uses MyMemory API only as it's reliable in China and provides complete translations
+ */
+async function doTranslateInternal(text: string, source: string, target: string): Promise<TranslationResult> {
+  // Check cache
+  const cacheKey = `${source}:${target}:${text}`
+  const cached = translationCache.get(cacheKey)
+  if (cached) {
+    return { ok: true, translatedText: cached }
+  }
+
+  // Use MyMemory (works reliably in China, provides complete translations)
+  const result = await translateWithMyMemory(text, source, target)
+  if (result.ok && result.translatedText !== text) {
+    safeLog(`[Translation] Success: "${result.translatedText.substring(0, 50)}${result.translatedText.length > 50 ? '...' : ''}"`)
+    translationCache.set(cacheKey, result.translatedText)
+    saveCacheToDisk()
+    return result
+  }
+
+  safeError(`[Translation] Failed:`, result.error)
+
+  // Translation failed, return original text
+  return {
+    ok: false,
+    translatedText: text,
+    error: result.error || 'Translation service unavailable',
+  }
+}
+
+/**
+ * Translate text using multiple translation APIs with fallback (with rate limiting)
+ */
+export async function translateText(request: TranslateRequest): Promise<TranslationResult> {
+  const { text, source = 'en', target = 'zh' } = request
+
+  safeLog(`[Translation] Request: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}" (${source} → ${target})`)
+
+  // Return original text if it contains Chinese
+  if (containsChinese(text)) {
+    safeLog(`[Translation] Already contains Chinese, skipping`)
+    return { ok: true, translatedText: text }
+  }
+
+  // Check cache first
+  const cacheKey = `${source}:${target}:${text}`
+  const cached = translationCache.get(cacheKey)
+  if (cached) {
+    safeLog(`[Translation] Cache hit`)
+    return { ok: true, translatedText: cached }
+  }
+
+  safeLog(`[Translation] Cache miss, queuing request...`)
+
+  // Add to queue and wait for result
+  return new Promise((resolve, reject) => {
+    requestQueue.push({
+      text,
+      source,
+      target,
+      resolve,
+      reject,
+    })
+    
+    // Start processing queue
+    processQueue().catch((error) => {
+      safeError('[Translation] Queue processing error:', error)
+    })
+  })
+}
+
+/**
+ * Batch translate multiple texts
+ */
+export async function translateBatch(
+  texts: string[],
+  options?: { source?: string; target?: string }
+): Promise<TranslationResult[]> {
+  return Promise.all(
+    texts.map((text) =>
+      translateText({
+        text,
+        source: options?.source,
+        target: options?.target,
+      })
+    )
+  )
+}
+
+/**
+ * Get cache size
+ */
+export function getTranslationCacheSize(): number {
+  return translationCache.size
+}
