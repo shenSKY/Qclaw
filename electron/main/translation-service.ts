@@ -69,24 +69,7 @@ export function needsTranslation(text: string): boolean {
   return englishPattern.test(text)
 }
 
-/**
- * Safe console.log that catches EPIPE errors
- */
-function safeLog(message: string, ...args: any[]): void {
-  try {
-    console.log(message, ...args)
-  } catch {
-    // Ignore EPIPE errors when process is shutting down
-  }
-}
 
-function safeError(message: string, ...args: any[]): void {
-  try {
-    console.error(message, ...args)
-  } catch {
-    // Ignore EPIPE errors when process is shutting down
-  }
-}
 
 /**
  * Get the cache file path
@@ -115,11 +98,10 @@ export function loadTranslationCache(): void {
         Object.entries(cacheData.translations).forEach(([key, value]) => {
           translationCache.set(key, value)
         })
-        safeLog(`[Translation] Loaded ${translationCache.size} cached translations from disk`)
       }
     }
   } catch (error) {
-    safeError('[Translation] Failed to load cache:', error)
+    // Silent error handling
   } finally {
     isCacheLoaded = true
   }
@@ -162,9 +144,8 @@ function saveCacheToDisk(): void {
         translations: Object.fromEntries(translationCache),
       }
       fs.writeFileSync(filePath, JSON.stringify(cacheData, null, 2), 'utf-8')
-      safeLog(`[Translation] Saved ${translationCache.size} translations to disk`)
     } catch (error) {
-      safeError('[Translation] Failed to save cache:', error)
+      // Silent error handling
     }
   }, SAVE_DELAY_MS)
 }
@@ -294,13 +275,10 @@ async function doTranslateInternal(text: string, source: string, target: string)
   // Use MyMemory (works reliably in China, provides complete translations)
   const result = await translateWithMyMemory(text, source, target)
   if (result.ok && result.translatedText !== text) {
-    safeLog(`[Translation] Success: "${result.translatedText.substring(0, 50)}${result.translatedText.length > 50 ? '...' : ''}"`)
     translationCache.set(cacheKey, result.translatedText)
     saveCacheToDisk()
     return result
   }
-
-  safeError(`[Translation] Failed:`, result.error)
 
   // Translation failed, return original text
   return {
@@ -311,16 +289,58 @@ async function doTranslateInternal(text: string, source: string, target: string)
 }
 
 /**
+ * Process translation queue with rate limiting
+ */
+async function processQueue(): Promise<void> {
+  if (isProcessingQueue || requestQueue.length === 0) {
+    return
+  }
+
+  isProcessingQueue = true
+
+  const processNext = async (): Promise<void> => {
+    if (requestQueue.length === 0) {
+      isProcessingQueue = false
+      return
+    }
+
+    // Enforce rate limiting
+    const now = Date.now()
+    const timeSinceLastRequest = now - lastRequestTime
+    if (timeSinceLastRequest < REQUEST_INTERVAL_MS) {
+      await new Promise((resolve) => setTimeout(resolve, REQUEST_INTERVAL_MS - timeSinceLastRequest))
+    }
+
+    // Process up to CONCURRENT_LIMIT requests
+    const batch = requestQueue.splice(0, Math.min(CONCURRENT_LIMIT, requestQueue.length))
+    lastRequestTime = Date.now()
+
+    await Promise.all(
+      batch.map(async (req) => {
+        try {
+          const result = await doTranslateInternal(req.text, req.source, req.target)
+          req.resolve(result)
+        } catch (error) {
+          req.reject(error instanceof Error ? error : new Error(String(error)))
+        }
+      })
+    )
+
+    // Continue processing next batch
+    await processNext()
+  }
+
+  await processNext()
+}
+
+/**
  * Translate text using multiple translation APIs with fallback (with rate limiting)
  */
 export async function translateText(request: TranslateRequest): Promise<TranslationResult> {
   const { text, source = 'en', target = 'zh' } = request
 
-  safeLog(`[Translation] Request: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}" (${source} → ${target})`)
-
   // Return original text if it contains Chinese
   if (containsChinese(text)) {
-    safeLog(`[Translation] Already contains Chinese, skipping`)
     return { ok: true, translatedText: text }
   }
 
@@ -328,11 +348,8 @@ export async function translateText(request: TranslateRequest): Promise<Translat
   const cacheKey = `${source}:${target}:${text}`
   const cached = translationCache.get(cacheKey)
   if (cached) {
-    safeLog(`[Translation] Cache hit`)
     return { ok: true, translatedText: cached }
   }
-
-  safeLog(`[Translation] Cache miss, queuing request...`)
 
   // Add to queue and wait for result
   return new Promise((resolve, reject) => {
@@ -345,8 +362,8 @@ export async function translateText(request: TranslateRequest): Promise<Translat
     })
     
     // Start processing queue
-    processQueue().catch((error) => {
-      safeError('[Translation] Queue processing error:', error)
+    processQueue().catch(() => {
+      // Silent error handling
     })
   })
 }
