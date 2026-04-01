@@ -1,6 +1,7 @@
 /**
- * Translation service using MyMemory API
- * MyMemory is free, requires no API key, works reliably in China, and provides complete translations
+ * Translation service using multiple translation APIs
+ * Primary: MyMemory API (free, no API key, works reliably in China)
+ * Fallback: Google Translate (unofficial free API, used when MyMemory quota is exceeded)
  * https://mymemory.translated.net/doc/spec.php
  */
 
@@ -176,7 +177,7 @@ export function initTranslationService(): void {
 /**
  * Translate using MyMemory API (free, no API key required)
  * https://mymemory.translated.net/doc/spec.php
- * This is the only translation service used as it works reliably in China
+ * This is the primary translation service as it works reliably in China
  */
 async function translateWithMyMemory(
   text: string,
@@ -259,8 +260,74 @@ async function translateWithMyMemory(
 }
 
 /**
+ * Translate using Google Translate (unofficial free API)
+ * Fallback when MyMemory quota is exceeded
+ * Note: This is an unofficial API that may have limitations
+ */
+async function translateWithGoogle(
+  text: string,
+  source: string,
+  target: string
+): Promise<TranslationResult> {
+  try {
+    // Google Translate uses different language codes
+    const langMap: Record<string, string> = {
+      'zh': 'zh-CN',
+      'en': 'en',
+    }
+
+    const sourceLang = langMap[source] || source
+    const targetLang = langMap[target] || target
+
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`
+
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 15000)
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      signal: controller.signal,
+    })
+
+    clearTimeout(timeoutId)
+
+    if (!response.ok) {
+      return { ok: false, translatedText: text, error: `HTTP ${response.status}` }
+    }
+
+    const data = await response.json() as any[]
+
+    // Parse response: data[0] contains an array of [translation, source] tuples
+    if (data && data[0]) {
+      const translatedText = data[0].map((item: any) => item[0]).filter(Boolean).join('')
+
+      if (translatedText) {
+        return { ok: true, translatedText }
+      }
+    }
+
+    return { ok: false, translatedText: text, error: 'No translation returned' }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Network error'
+
+    if (errorMessage.includes('abort') || errorMessage.includes('EPIPE')) {
+      return { ok: false, translatedText: text, error: 'Request cancelled' }
+    }
+
+    return {
+      ok: false,
+      translatedText: text,
+      error: errorMessage,
+    }
+  }
+}
+
+/**
  * Internal translation function without queue (used by queue processor)
- * Uses MyMemory API only as it's reliable in China and provides complete translations
+ * Uses MyMemory API as primary, Google Translate as fallback
  */
 async function doTranslateInternal(text: string, source: string, target: string): Promise<TranslationResult> {
   // Check cache
@@ -270,19 +337,43 @@ async function doTranslateInternal(text: string, source: string, target: string)
     return { ok: true, translatedText: cached }
   }
 
-  // Use MyMemory (works reliably in China, provides complete translations)
-  const result = await translateWithMyMemory(text, source, target)
-  if (result.ok && result.translatedText !== text) {
-    translationCache.set(cacheKey, result.translatedText)
+  // Try MyMemory first (works reliably in China, provides complete translations)
+  const myMemoryResult = await translateWithMyMemory(text, source, target)
+
+  // If MyMemory succeeds, cache and return
+  if (myMemoryResult.ok && myMemoryResult.translatedText !== text) {
+    translationCache.set(cacheKey, myMemoryResult.translatedText)
     saveCacheToDisk()
-    return result
+    return myMemoryResult
   }
 
-  // Translation failed, return original text
+  // If MyMemory fails due to quota, try Google Translate as fallback
+  if (myMemoryResult.error?.includes('quota') || myMemoryResult.error?.includes('429')) {
+    console.log(`[Translation] MyMemory quota exceeded, falling back to Google Translate`)
+    const googleResult = await translateWithGoogle(text, source, target)
+
+    if (googleResult.ok && googleResult.translatedText !== text) {
+      translationCache.set(cacheKey, googleResult.translatedText)
+      saveCacheToDisk()
+      return {
+        ok: true,
+        translatedText: googleResult.translatedText,
+      }
+    }
+
+    // Both services failed
+    return {
+      ok: false,
+      translatedText: text,
+      error: `Translation failed (MyMemory: ${myMemoryResult.error}, Google: ${googleResult.error})`,
+    }
+  }
+
+  // Translation failed for other reasons
   return {
     ok: false,
     translatedText: text,
-    error: result.error || 'Translation service unavailable',
+    error: myMemoryResult.error || 'Translation service unavailable',
   }
 }
 
